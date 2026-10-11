@@ -1,0 +1,79 @@
+name: mirror-google-keys
+
+# 每 6 小时把 Google 的登录公钥（JWKS）抓一份存进本仓库的 google.json，
+# 供「就位」服务器读取（服务器在北京，连不上 Google；见主仓库 docs/第三方登录.md 第六节）。
+# 只提交变化：公钥没变就不产生提交；但每 7 天至少提交一次心跳（heartbeat.txt），
+# 因为 GitHub 会把「60 天没有任何活动」的公开仓库的定时任务自动停掉，停了就没人发现公钥换了。
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-google-keys
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # 不用 actions/checkout：它是第三方 action，引用的是可变的 v4 标签，而这个工作流有仓库写权限，
+      # 谁能改那个标签谁就能往本仓库的 google.json 里塞公钥（= 能伪造任意 Google 用户登录）。
+      # 这里只需要一次 git clone，直接用 GitHub 自带的令牌，少一个供应链环节
+      - name: 检出本仓库
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+
+      - name: 抓取并校验 Google 公钥
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 https://www.googleapis.com/oauth2/v3/certs -o new.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('new.json'))
+          keys = d.get('keys')
+          assert isinstance(keys, list) and keys, 'keys 为空：不覆盖现有文件'
+          for k in keys:
+              for f in ('kid', 'kty', 'n', 'e'):
+                  assert k.get(f), '缺少字段 ' + f
+              assert k['kty'] == 'RSA', '出现非 RSA 的公钥：' + str(k['kty'])
+              assert len(k['n']) >= 340, '公钥模数短于 2048 位：不覆盖现有文件'
+          # 排序 + 固定缩进：只是字段顺序变了不该产生提交
+          keys.sort(key=lambda k: k['kid'])
+          with open('new.json', 'w') as f:
+              json.dump({'keys': keys}, f, indent=2, sort_keys=True)
+              f.write('\n')
+          print('Google 公钥 %d 把：%s' % (len(keys), ', '.join(k['kid'][:8] for k in keys)))
+          PY
+
+      - name: 有变化、或超过 7 天没提交，才提交
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          changed=0
+          if ! cmp -s new.json google.json; then
+            cp new.json google.json
+            git add google.json
+            git commit -m "Google 公钥更新"
+            changed=1
+          fi
+          rm -f new.json
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ "$changed" = "0" ] && [ $((now - last)) -gt $((7 * 24 * 3600)) ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git add heartbeat.txt
+            git commit -m "心跳：公钥没有变化，保持定时任务活跃"
+            changed=1
+          fi
+          if [ "$changed" = "1" ]; then git push; else echo "无需提交"; fi
